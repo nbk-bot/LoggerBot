@@ -1,140 +1,121 @@
-# LoggerBot NuGet Package
+# LoggerBot
 
-## Overview
-The LoggerBot NuGet package provides a logging service that integrates with Telegram bots. It allows developers to easily log messages of various types (error, info, warning, success, and generic messages) to a designated Telegram chat using a Telegram bot.
+Telegram bot orqali ASP.NET Core ilovalardan log yuborish uchun NuGet paket. v1.6.0 — `IOptions<LoggerBotOptions>`, `IHttpClientFactory`, va multi-target net6-10.
 
-## Installation
-You can install the LoggerBot NuGet package via the NuGet Package Manager or the .NET CLI:
+## Quick install
 
 ```bash
-
-dotnet add package LoggerBot
-
+dotnet add package LoggerBot --version 1.6.0
 ```
 
-# Basic Usage
-1. Configure LoggerBot
-First, configure LoggerBot in your application's startup code to register the logger service in the dependency injection container:
+## Targets
 
-```csharp
-
-using LoggerBot;
-
-builder.Services.AddLoggerBot();
-```
-
-2. Inject and Use LoggerService
-Inject the ILoggerService interface into your classes where logging is required and use its methods to log messages:
-
-```csharp
-
-using LoggerBot.Services;
-
-public class MyClass
-{
-    private readonly ILoggerService _logger;
-
-    public MyClass(ILoggerService logger)
-    {
-        _logger = logger;
-    }
-
-    public async Task SomeMethod()
-    {
-        // Log an error message
-        await _logger.ErrorAsync("An error occurred.");
-
-        // Log an info message
-        await _logger.InfoAsync("Some information message.");
-
-        // Log a success message
-        await _logger.SuccessAsync("Operation completed successfully.");
-
-        // Log a warning message
-        await _logger.WarningAsync("Warning: Resource limit exceeded.");
-
-        // Log a generic message
-        await _logger.MessageAsync("A generic message.");
-    }
-}
-
-```
+`net6.0` / `net7.0` / `net8.0` / `net9.0` / `net10.0`
 
 ## Configuration
-_The LoggerBot requires configuration settings to connect to your Telegram bot. Ensure the following configuration keys are present in your appsettings.json or environment variables:_
 
-**LoggerBot:Token:** The token of your Telegram bot.
+`appsettings.json` ichida `LoggerBot` sectionini to'ldiring:
 
-**LoggerBot:ChatId:** The ID of the Telegram chat where logs will be sent.
-
-Example:
 ```json
-
-"LoggerBot": {
-  "Token": "bot-token",
-  "ChatId": "-100chatId"
+{
+  "LoggerBot": {
+    "Token": "123456:bot-token",
+    "ChatId": -100123456789
+  }
 }
-
 ```
 
-## Supported Log Types
- * **Error:** Used for logging error messages.
+Section nomi `LoggerBotOptions.SectionName` ("LoggerBot") orqali default keladi; options overload bilan o'zingiz qayta belgilashingiz mumkin.
 
- * **Info:** Used for logging informational messages.
+## Registration (recommended — `IOptions<LoggerBotOptions>`)
 
- * **Success:** Used for logging success messages.
+```csharp
+// appsettings.json'dan bind:
+builder.Services.AddLoggerBot();
 
- * **Warning:** Used for logging warning messages.
-
- * **Message:** Used for logging generic messages.
-
-
-Feel free to expand upon this documentation with more details specific to your package's usage or additional features!
-
-# Strong usage
-
-
-If you want to use multiple projects (chats), you can setup like this:
-```json
-
-"LoggerBot": {
-  "Token": "bot-token",
-  "Project1": "-100chatId1",
-  "Project2": "-100chatId2",
-  "Project3": "-100chatId3"
-  ...
-}
-
+// yoki dasturiy ravishda:
+builder.Services.AddLoggerBot(o =>
+{
+    o.Token = "123456:bot-token";
+    o.ChatId = -100123456789;
+});
 ```
 
-Additionaly you can catch fully detailed exceptions:
+Ikkala overload ham `LoggerBotOptions`, named `HttpClient` ("LoggerBot") va `ILoggerService` singletonni ro'yxatga oladi.
 
-```cshap
+## Usage
+
+`ILoggerService` ni controller yoki handlerga inject qiling. Har bir metod `CancellationToken` qabul qiladi va u `botClient.SendTextMessageAsync` ga uzatiladi.
+
+```csharp
 using LoggerBot.Services;
+using Microsoft.AspNetCore.Mvc;
 
-public class MyClass
+[ApiController]
+[Route("api/[controller]")]
+public class OrdersController : ControllerBase
 {
     private readonly ILoggerService _logger;
 
-    public MyClass(ILoggerService logger)
-    {
-        _logger = logger;
-    }
+    public OrdersController(ILoggerService logger) => _logger = logger;
 
-    public async Task SomeMethod()
+    [HttpPost]
+    public async Task<IActionResult> Create(CancellationToken ct)
     {
+        await _logger.InfoAsync("Order create boshlandi", cancellationToken: ct);
+
         try
         {
-            //some code
+            // ... biznes logikasi
+            await _logger.SuccessAsync("Order yaratildi", cancellationToken: ct);
+            await _logger.MessageAsync("Audit: yangi buyurtma", cancellationToken: ct);
+            await _logger.WarningAsync("Stok kam qoldi", cancellationToken: ct);
+            return Ok();
         }
-        catch(Exception exception)
+        catch (Exception ex)
         {
-            //just message
-            await _logger.ErrorAsync("An error occurred.", "Project1");
+            await _logger.ErrorAsync(ex, detailed: true, cancellationToken: ct);
 
-            //detailed message
-            await _logger.ErrorAsync(exception, "Project1", detailed: true);
+            var dump = System.Text.Encoding.UTF8.GetBytes(ex.ToString());
+            await _logger.ErrorAttachmentAsync("Order yaratishda xatolik", dump, cancellationToken: ct);
+            return StatusCode(500);
         }
     }
 }
 ```
+
+## Legacy API (deprecated)
+
+Eski `LoggerService(IConfiguration, IHostEnvironment)` konstruktori `[Obsolete]` deb belgilangan. Yangi konstruktor `IOptions<LoggerBotOptions>` qabul qiladi — DI orqali avtomatik chaqiriladi. Iltimos `IOptions<LoggerBotOptions>` ga ko'chib o'ting.
+
+## What's new in 1.6.0
+
+- Multi-target: `net6.0` / `net7.0` / `net8.0` / `net9.0` / `net10.0`
+- Strongly-typed `LoggerBotOptions` (`Token`, `ChatId`, `SectionName`)
+- `IHttpClientFactory` orqali named `HttpClient` ("LoggerBot") — `TelegramBotClient` shu HttpClient ustida ishlaydi
+- `Interlocked.CompareExchange` bilan race-free queue worker — aniq bitta worker ishga tushadi
+- `CancellationToken` butun yo'l bo'ylab `botClient.SendTextMessageAsync` ga uzatiladi
+- `Console.WriteLine` olib tashlandi — agar inject qilingan bo'lsa `ILogger<LoggerService>` ishlatiladi
+
+## Multi-project chats
+
+Bir nechta loyihaga (chatga) yozish kerak bo'lsa, `appsettings.json` ga qo'shimcha kalitlar qo'shing va metod chaqirig'ida `projectName` bering:
+
+```json
+{
+  "LoggerBot": {
+    "Token": "bot-token",
+    "ChatId": -100default,
+    "Project1": -100chatId1,
+    "Project2": -100chatId2
+  }
+}
+```
+
+```csharp
+await _logger.ErrorAsync(exception, "Project1", detailed: true, cancellationToken: ct);
+```
+
+## License / contributing
+
+Issue va PR'lar ochiq — `https://github.com/nbk-bot/LoggerBot`. Litsenziya repo ildizidagi `LICENSE` fayliga muvofiq.
