@@ -1,4 +1,4 @@
-﻿using Telegram.Bot.Exceptions;
+using Telegram.Bot.Exceptions;
 
 namespace LoggerBot.Services;
 
@@ -6,7 +6,10 @@ public partial class LoggerService
 {
     private readonly ConcurrentQueue<LogMessage> _messageQueue = new();
     private readonly SemaphoreSlim _semaphore = new(1, 1);
-    private volatile bool _isProcessing = false;
+
+    // 0 = idle, 1 = a worker is running. Interlocked.CompareExchange ensures
+    // that at most one ProcessQueueAsync loop is active at any time.
+    private int _isProcessing = 0;
 
     private static readonly TimeSpan RateLimitDelay = TimeSpan.FromMilliseconds(35); // 30 msg/sec → ~35ms delay
     private static readonly TimeSpan GroupLimitDelay = TimeSpan.FromSeconds(3); // 20 msg/min → 3 sec delay
@@ -20,9 +23,15 @@ public partial class LoggerService
 
     private void StartWorker()
     {
-        if (!_isProcessing && !_messageQueue.IsEmpty)
+        if (_messageQueue.IsEmpty)
         {
-            _isProcessing = true;
+            return;
+        }
+
+        // Try to flip _isProcessing from 0 -> 1. Only the thread that wins this
+        // race actually spawns the worker task.
+        if (Interlocked.CompareExchange(ref _isProcessing, 1, 0) == 0)
+        {
             Task.Run(ProcessQueueAsync);
         }
     }
@@ -34,18 +43,32 @@ public partial class LoggerService
             while (_messageQueue.TryDequeue(out var message))
             {
                 var delay = GetGroupDelay(message.ChatId);
-                if (delay > TimeSpan.Zero) await Task.Delay(delay);
+                if (delay > TimeSpan.Zero)
+                {
+                    try
+                    {
+                        await Task.Delay(delay, message.CancellationToken).ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        // Caller asked us to stop sending this particular message.
+                        continue;
+                    }
+                }
 
-                await SendMessageWithRetry(message);
+                await SendMessageWithRetry(message).ConfigureAwait(false);
                 _groupLastSentTime[message.ChatId] = DateTime.UtcNow;
 
-                await Task.Delay(RateLimitDelay);
+                await Task.Delay(RateLimitDelay).ConfigureAwait(false);
             }
         }
         finally
         {
-            _isProcessing = false;
+            // Release the worker slot.
+            Interlocked.Exchange(ref _isProcessing, 0);
 
+            // A message may have been enqueued after our last TryDequeue but
+            // before we released the slot; re-arm the worker if so.
             if (!_messageQueue.IsEmpty)
             {
                 StartWorker();
@@ -61,23 +84,34 @@ public partial class LoggerService
         {
             try
             {
-                await SendMessage(message);
+                await SendMessage(message).ConfigureAwait(false);
                 return;
             }
             catch (ApiRequestException ex) when (ex.ErrorCode == 429)
             {
                 int retryAfter = ex.Parameters?.RetryAfter ?? 5;
-                await Task.Delay(TimeSpan.FromSeconds(retryAfter));
+                try
+                {
+                    await Task.Delay(TimeSpan.FromSeconds(retryAfter), message.CancellationToken).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    return;
+                }
                 retryCount++;
+            }
+            catch (OperationCanceledException)
+            {
+                return;
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"[ERROR] Failed to send message: {ex.Message}");
+                _logger?.LogError(ex, "Failed to send message to chat {ChatId}", message.ChatId);
                 return;
             }
         }
 
-        Console.WriteLine("[ERROR] Max retries reached. Dropping message.");
+        _logger?.LogError("Max retries reached. Dropping message for chat {ChatId}", message.ChatId);
     }
 
     private async Task SendMessage(LogMessage message)
@@ -90,7 +124,8 @@ public partial class LoggerService
                 document: new InputFileStream(stream, "details.json"),
                 caption: message.Text,
                 parseMode: Telegram.Bot.Types.Enums.ParseMode.Markdown,
-                disableNotification: true);
+                disableNotification: true,
+                cancellationToken: message.CancellationToken).ConfigureAwait(false);
         }
         else
         {
@@ -98,7 +133,8 @@ public partial class LoggerService
                 chatId: message.ChatId,
                 text: message.Text,
                 parseMode: Telegram.Bot.Types.Enums.ParseMode.Markdown,
-                disableNotification: true);
+                disableNotification: true,
+                cancellationToken: message.CancellationToken).ConfigureAwait(false);
         }
     }
 
